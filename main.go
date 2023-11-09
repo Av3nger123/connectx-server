@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os/exec"
 
-	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
 )
@@ -21,7 +20,7 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-func sshClientPEM(username string, signer ssh.Signer, remoteAddr string) (*ssh.Client, error) {
+func sshClient(username string, signer ssh.Signer, remoteAddr string) (*ssh.Client, error) {
 	config := &ssh.ClientConfig{
 		User:            username,
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
@@ -57,13 +56,72 @@ func handlerShellOutput(outputChannel chan string, reader io.Reader) {
 	}
 }
 
-func handleWebsocket(session *ssh.Session, conn *websocket.Conn, message string) {
-	log.Println("Message Recieved")
-	// Start the SSH session
-	err := session.Start(string(message))
+func handleMessage(session *ssh.Session, message string) []byte {
+
+	output, err := session.CombinedOutput(message)
 	if err != nil {
-		log.Printf("Failed to start SSH session: %v", err)
+		log.Printf("Failed to start SSH session with command: %s, Error: %v", message, err)
+		return nil
+	}
+	return output
+}
+
+func getSSHSession() {
+
+}
+
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+
+	// Websocket Connection
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WebSocket upgrade error: %v", err)
 		return
+	}
+	defer conn.Close()
+
+	username := "ec2-user"
+	// password := os.Getenv("PASSWORD")
+	remoteAddr := "uat.liveolympiad.app:22"
+	fileBytes, err := ioutil.ReadFile("../../.ssh/id_rsa")
+	if err != nil {
+		log.Fatal(err)
+	}
+	signer, err := ssh.ParsePrivateKey(fileBytes)
+	if err != nil {
+		log.Fatalf("parse key failed:%v", err)
+	}
+
+	// SSH Client Connection
+	client, err := sshClient(username, signer, remoteAddr)
+	// client, err := sshClientLOCAL(username, password, remoteAddr)
+	if err != nil {
+		log.Printf("Failed to connect to the remote server: %v", err)
+		return
+	}
+	log.Println("Client Connected")
+	defer client.Close()
+
+	// SSH Client Session
+	session, err := client.NewSession()
+	if err != nil {
+		log.Fatalln(err.Error())
+		return
+	}
+	defer session.Close()
+
+	for {
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			log.Printf("WebSocket read error: %v", err.Error())
+			return
+		}
+		output := handleMessage(session, string(message))
+		log.Printf("Command Output:\n%s", output)
+		err = conn.WriteMessage(websocket.TextMessage, []byte(string(output)))
+		if err != nil {
+			log.Println("Websocket write error")
+		}
 	}
 
 }
@@ -75,93 +133,11 @@ func runCommand(command string) ([]byte, error) {
 }
 
 func main() {
-	r := gin.Default()
 
-	r.GET("/ssh", func(c *gin.Context) {
-		username := "ubuntu"
-		// password := os.Getenv("PASSWORD")
-		remoteAddr := "13.235.71.251:22"
-		pemBytes, err := ioutil.ReadFile("../terraform/test")
-		if err != nil {
-			log.Fatal(err)
-		}
-		signer, err := ssh.ParsePrivateKey(pemBytes)
-		if err != nil {
-			log.Fatalf("parse key failed:%v", err)
-		}
+	http.HandleFunc("/ssh", handleWebSocket)
 
-		// SSH Client Connection
-		client, err := sshClientPEM(username, signer, remoteAddr)
-		// client, err := sshClientLOCAL(username, password, remoteAddr)
-		if err != nil {
-			log.Printf("Failed to connect to the remote server: %v", err)
-			return
-		}
-		log.Println("Client Connected")
-		defer client.Close()
-
-		// Websocket Connection
-		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
-		if err != nil {
-			log.Printf("WebSocket upgrade error: %v", err)
-			return
-		}
-		defer conn.Close()
-
-		// SSH Client Session
-		session, err := client.NewSession()
-		if err != nil {
-			log.Fatalln(err.Error())
-			return
-		}
-		defer session.Close()
-		for {
-			_, message, err := conn.ReadMessage()
-			if err != nil {
-				log.Printf("WebSocket read error: %v", err)
-				return
-			}
-			// Set up pipes to capture standard output and standard error
-			stdout, err := session.StdoutPipe()
-			if err != nil {
-				log.Printf("Failed to create stdout pipe: %v", err)
-				return
-			}
-			stderr, err := session.StderrPipe()
-			if err != nil {
-				log.Printf("Failed to create stderr pipe: %v", err)
-				return
-			}
-
-			// Create channels for collecting the output and errors
-			output := make(chan string)
-			errors := make(chan string)
-
-			// Goroutine to collect and send the output to the WebSocket
-			go handlerShellOutput(output, stdout)
-
-			// Goroutine to collect and send the errors to the WebSocket
-			go handlerShellOutput(errors, stderr)
-
-			handleWebsocket(session, conn, string(message))
-
-			for {
-				select {
-				case msg := <-output:
-					if err := conn.WriteMessage(websocket.TextMessage, []byte("output: "+msg)); err != nil {
-						log.Printf("WebSocket write error: %v", err)
-						return
-					}
-				case msg := <-errors:
-					if err := conn.WriteMessage(websocket.TextMessage, []byte("error: "+msg)); err != nil {
-						log.Printf("WebSocket write error: %v", err)
-						return
-					}
-				}
-			}
-		}
-
-	})
-
-	r.Run(":8080")
+	err := http.ListenAndServe(":8080", nil)
+	if err != nil {
+		log.Fatal("ListenAndServe: ", err)
+	}
 }
